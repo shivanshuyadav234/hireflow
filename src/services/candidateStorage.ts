@@ -13,6 +13,11 @@ import { SupabaseCandidateRepository } from './supabaseRepository';
 export type { CandidateRepository };
 export const STORAGE_KEY = 'hireflow_candidates_v1';
 
+// Bump this version string whenever INITIAL_CANDIDATES preset data is updated.
+// On mismatch the localStorage store is wiped and re-seeded automatically.
+const PRESET_VERSION = '2026-11-10-v2';
+const VERSION_KEY = 'hireflow_preset_version';
+
 const VALID_STAGES: CandidateStage[] = ['applied', 'screening', 'interview', 'offer', 'hired', 'rejected'];
 
 /**
@@ -80,11 +85,20 @@ export class LocalStorageCandidateRepository implements CandidateRepository {
     if (typeof window === 'undefined' || !window.localStorage) {
       return [...INITIAL_CANDIDATES];
     }
+
+    // If the stored preset version doesn't match, wipe and re-seed with fresh data.
+    const storedVersion = window.localStorage.getItem(VERSION_KEY);
+    if (storedVersion !== PRESET_VERSION) {
+      console.info('[HireFlow Storage] Preset version changed — re-seeding demo data.');
+      window.localStorage.removeItem(this.key);
+      window.localStorage.setItem(VERSION_KEY, PRESET_VERSION);
+    }
+
     const raw = window.localStorage.getItem(this.key);
     const sanitized = sanitizeLoadedCandidates(raw);
-    
-    // If not previously stored or sanitized back to defaults, prime the store
-    if (!raw) {
+
+    // Seed localStorage whenever it's missing, empty, or fell back to defaults.
+    if (!raw || sanitized.length === 0) {
       this.saveRaw(sanitized);
     }
     return sanitized;
@@ -189,14 +203,74 @@ export class LocalStorageCandidateRepository implements CandidateRepository {
   }
 }
 
-// Repository factory: Instantiates Supabase repository if configured,
-// or falls back explicitly to LocalStorage repository for local demo evaluation.
+/**
+ * Resilient repository that tries Supabase first and automatically falls back
+ * to LocalStorage if Supabase is unreachable (deleted project, paused, network error).
+ */
+export class ResilientCandidateRepository implements CandidateRepository {
+  private primary: CandidateRepository;
+  private fallback: LocalStorageCandidateRepository;
+  private useFallback: boolean = false;
+
+  constructor(primary: CandidateRepository) {
+    this.primary = primary;
+    this.fallback = new LocalStorageCandidateRepository();
+  }
+
+  private async withFallback<T>(op: () => Promise<T>, fallbackOp: () => Promise<T>): Promise<T> {
+    if (this.useFallback) return fallbackOp();
+    try {
+      return await op();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn('[HireFlow Storage] Supabase unreachable, switching to localStorage fallback:', msg);
+      this.useFallback = true;
+      return fallbackOp();
+    }
+  }
+
+  public async getAll(): Promise<Candidate[]> {
+    return this.withFallback(() => this.primary.getAll(), () => this.fallback.getAll());
+  }
+
+  public async getById(id: string): Promise<Candidate | null> {
+    return this.withFallback(() => this.primary.getById(id), () => this.fallback.getById(id));
+  }
+
+  public async create(input: NewCandidateInput): Promise<Candidate> {
+    return this.withFallback(() => this.primary.create(input), () => this.fallback.create(input));
+  }
+
+  public async update(id: string, input: UpdateCandidateInput): Promise<Candidate> {
+    return this.withFallback(() => this.primary.update(id, input), () => this.fallback.update(id, input));
+  }
+
+  public async updateStage(id: string, stage: CandidateStage): Promise<Candidate> {
+    return this.withFallback(() => this.primary.updateStage(id, stage), () => this.fallback.updateStage(id, stage));
+  }
+
+  public async delete(id: string): Promise<boolean> {
+    return this.withFallback(() => this.primary.delete(id), () => this.fallback.delete(id));
+  }
+
+  public async resetToDemo(): Promise<Candidate[]> {
+    return this.withFallback(() => this.primary.resetToDemo(), () => this.fallback.resetToDemo());
+  }
+
+  public getStorageInfo(): { mode: StorageMode; recordCount: number; isFallback: boolean } {
+    if (this.useFallback) return this.fallback.getStorageInfo();
+    return this.primary.getStorageInfo();
+  }
+}
+
+// Repository factory: Instantiates Supabase repository if configured (with resilient
+// auto-fallback to localStorage), or plain localStorage for demo mode.
 export function createCandidateRepository(): CandidateRepository {
   if (isSupabaseConfigured() && supabase) {
-    console.info('[HireFlow Storage] Initializing Supabase PostgreSQL repository as primary source of truth.');
-    return new SupabaseCandidateRepository(supabase);
+    console.info('[HireFlow Storage] Supabase credentials found — initializing with resilient fallback.');
+    return new ResilientCandidateRepository(new SupabaseCandidateRepository(supabase));
   }
-  console.info('[HireFlow Storage] Supabase credentials not found. Initializing LocalStorage repository in explicit Demo Fallback mode.');
+  console.info('[HireFlow Storage] No Supabase credentials — using LocalStorage demo mode.');
   return new LocalStorageCandidateRepository();
 }
 
